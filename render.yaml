@@ -1,15 +1,12 @@
 # Render Blueprint for Meeting Transcription Bot
-# See: https://render.com/docs/blueprint-spec
+# Uses Docker for ffmpeg support
 
 services:
   - type: web
     name: meeting-summary-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11"
       - key: LINE_CHANNEL_ACCESS_TOKEN
         sync: false
       - key: LINE_CHANNEL_SECRET
@@ -20,6 +17,8 @@ services:
         sync: false
       - key: DAILY_PASSWORD_SEED
         sync: false
+      - key: PORT
+        value: "5000"
     # Free tier settings
     plan: free
     healthCheckPath: /health
