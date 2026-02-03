@@ -1,4 +1,4 @@
-"""Transcription service using Groq Whisper API with chunking support."""
+"""Transcription service using Groq Whisper API with parallel chunking."""
 from __future__ import annotations
 
 import tempfile
@@ -6,6 +6,7 @@ import logging
 import subprocess
 import os
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from groq import Groq
 
 logger = logging.getLogger(__name__)
@@ -13,8 +14,11 @@ logger = logging.getLogger(__name__)
 # Maximum file size for Groq free tier (25MB)
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB in bytes
 
-# Chunk duration in seconds (10 minutes per chunk to stay under 25MB)
-CHUNK_DURATION = 600
+# Chunk duration in seconds (25 minutes = much fewer chunks)
+CHUNK_DURATION = 1500  # 25 minutes
+
+# Max parallel workers for transcription
+MAX_WORKERS = 4
 
 
 class TranscriptionService:
@@ -22,7 +26,7 @@ class TranscriptionService:
     
     Uses Whisper Large V3 Turbo model for fast, accurate transcription.
     Supports Chinese (Mandarin) and English languages.
-    Automatically chunks large files to handle 1+ hour recordings.
+    Automatically chunks large files and processes them in PARALLEL.
     """
     
     # Groq Whisper model - turbo is faster and cheaper
@@ -34,6 +38,7 @@ class TranscriptionService:
         Args:
             api_key: Groq API key
         """
+        self.api_key = api_key
         self.client = Groq(api_key=api_key)
     
     def _get_audio_duration(self, file_path: Path) -> float | None:
@@ -56,7 +61,7 @@ class TranscriptionService:
         return None
     
     def _split_audio(self, file_path: Path, chunk_duration: int = CHUNK_DURATION) -> list[Path]:
-        """Split audio into chunks using ffmpeg.
+        """Split audio into chunks using ffmpeg (fast, no re-encoding).
         
         Args:
             file_path: Path to the audio file
@@ -72,40 +77,57 @@ class TranscriptionService:
             # Get total duration
             duration = self._get_audio_duration(file_path)
             if not duration:
-                # If we can't get duration, just return original file
                 logger.warning("Could not determine audio duration, using original file")
                 return [file_path]
-            
-            logger.info(f"Audio duration: {duration:.1f}s, splitting into {chunk_duration}s chunks")
             
             # Calculate number of chunks needed
             num_chunks = int(duration // chunk_duration) + (1 if duration % chunk_duration > 0 else 0)
             
+            logger.info(f"Audio: {duration/60:.1f} min, splitting into {num_chunks} chunks of {chunk_duration/60:.0f} min each")
+            
             if num_chunks == 1:
                 return [file_path]
             
-            # Split using ffmpeg
+            # Get file extension
+            ext = file_path.suffix or '.m4a'
+            
+            # Split using ffmpeg with stream copy (FAST - no re-encoding)
             for i in range(num_chunks):
                 start_time = i * chunk_duration
-                output_path = temp_dir / f"chunk_{i:03d}.m4a"
+                output_path = temp_dir / f"chunk_{i:03d}{ext}"
                 
                 try:
                     result = subprocess.run(
                         [
                             'ffmpeg', '-y', '-i', str(file_path),
                             '-ss', str(start_time), '-t', str(chunk_duration),
-                            '-c:a', 'aac', '-b:a', '64k',  # Compress to reduce size
+                            '-c', 'copy',  # Stream copy = FAST, no re-encoding
+                            '-avoid_negative_ts', 'make_zero',
                             str(output_path)
                         ],
                         capture_output=True,
-                        timeout=120
+                        timeout=60
                     )
                     
                     if result.returncode == 0 and output_path.exists():
+                        size_kb = output_path.stat().st_size / 1024
                         chunks.append(output_path)
-                        logger.info(f"Created chunk {i+1}/{num_chunks}: {output_path.stat().st_size / 1024:.1f}KB")
+                        logger.info(f"Chunk {i+1}/{num_chunks}: {size_kb:.0f}KB")
                     else:
-                        logger.error(f"FFmpeg failed for chunk {i}: {result.stderr.decode()}")
+                        # If stream copy fails, try with re-encoding
+                        logger.warning(f"Stream copy failed for chunk {i}, trying with re-encode")
+                        result = subprocess.run(
+                            [
+                                'ffmpeg', '-y', '-i', str(file_path),
+                                '-ss', str(start_time), '-t', str(chunk_duration),
+                                '-c:a', 'aac', '-b:a', '64k',
+                                str(output_path)
+                            ],
+                            capture_output=True,
+                            timeout=120
+                        )
+                        if result.returncode == 0 and output_path.exists():
+                            chunks.append(output_path)
                         
                 except Exception as e:
                     logger.error(f"Error creating chunk {i}: {e}")
@@ -119,9 +141,16 @@ class TranscriptionService:
     def _transcribe_single(
         self,
         file_path: Path,
+        chunk_index: int,
+        total_chunks: int,
         language: str | None = None
     ) -> dict:
-        """Transcribe a single audio file."""
+        """Transcribe a single audio file (used for parallel processing)."""
+        # Create a new client for this thread (thread safety)
+        client = Groq(api_key=self.api_key)
+        
+        logger.info(f"🎤 Transcribing chunk {chunk_index + 1}/{total_chunks}...")
+        
         params = {
             "model": self.MODEL,
             "response_format": "verbose_json",
@@ -131,12 +160,15 @@ class TranscriptionService:
             params["language"] = language
         
         with open(file_path, "rb") as audio_file:
-            response = self.client.audio.transcriptions.create(
+            response = client.audio.transcriptions.create(
                 file=audio_file,
                 **params
             )
         
+        logger.info(f"✅ Chunk {chunk_index + 1}/{total_chunks} done!")
+        
         return {
+            "index": chunk_index,
             "text": response.text,
             "language": getattr(response, "language", "unknown"),
             "duration": getattr(response, "duration", None),
@@ -148,7 +180,7 @@ class TranscriptionService:
         file_extension: str = "m4a",
         language: str | None = None,
     ) -> dict:
-        """Transcribe audio data to text. Handles large files automatically.
+        """Transcribe audio data to text. Handles large files with PARALLEL processing.
         
         Args:
             audio_data: Raw audio file bytes
@@ -168,50 +200,75 @@ class TranscriptionService:
             temp_path = Path(temp_file.name)
         
         file_size = len(audio_data)
-        logger.info(f"Transcribing audio: {file_size / 1024 / 1024:.2f}MB")
+        logger.info(f"📁 Transcribing audio: {file_size / 1024 / 1024:.2f}MB")
         
         chunks_to_cleanup = []
         
         try:
             # Check if we need to split the file
             if file_size > MAX_FILE_SIZE:
-                logger.info(f"File exceeds {MAX_FILE_SIZE / 1024 / 1024}MB limit, splitting...")
+                logger.info(f"⚡ File exceeds {MAX_FILE_SIZE / 1024 / 1024}MB limit, splitting for parallel processing...")
                 chunk_paths = self._split_audio(temp_path)
                 chunks_to_cleanup = [p for p in chunk_paths if p != temp_path]
             else:
                 chunk_paths = [temp_path]
             
-            # Transcribe each chunk
-            all_transcripts = []
-            total_duration = 0
-            detected_language = "unknown"
+            total_chunks = len(chunk_paths)
             
-            for i, chunk_path in enumerate(chunk_paths):
-                if len(chunk_paths) > 1:
-                    logger.info(f"Transcribing chunk {i+1}/{len(chunk_paths)}")
+            # PARALLEL TRANSCRIPTION
+            if total_chunks > 1:
+                logger.info(f"🚀 Processing {total_chunks} chunks in PARALLEL...")
+                results = []
                 
-                try:
-                    result = self._transcribe_single(chunk_path, language)
-                    all_transcripts.append(result["text"])
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    # Submit all chunks for parallel processing
+                    future_to_index = {
+                        executor.submit(
+                            self._transcribe_single, 
+                            chunk_path, 
+                            i, 
+                            total_chunks, 
+                            language
+                        ): i
+                        for i, chunk_path in enumerate(chunk_paths)
+                    }
                     
-                    if result.get("duration"):
-                        total_duration += result["duration"]
-                    
-                    # Use first detected language
-                    if detected_language == "unknown" and result.get("language"):
-                        detected_language = result["language"]
-                        
-                except Exception as e:
-                    logger.error(f"Failed to transcribe chunk {i}: {e}")
-                    # Continue with other chunks even if one fails
-                    all_transcripts.append(f"[Chunk {i+1} failed: {str(e)[:50]}]")
+                    # Collect results as they complete
+                    for future in as_completed(future_to_index):
+                        chunk_index = future_to_index[future]
+                        try:
+                            result = future.result()
+                            results.append(result)
+                        except Exception as e:
+                            logger.error(f"❌ Chunk {chunk_index} failed: {e}")
+                            results.append({
+                                "index": chunk_index,
+                                "text": f"[Chunk {chunk_index + 1} failed: {str(e)[:50]}]",
+                                "language": "unknown",
+                                "duration": None
+                            })
+                
+                # Sort by index to maintain order
+                results.sort(key=lambda x: x["index"])
+                
+            else:
+                # Single file, no parallel needed
+                results = [self._transcribe_single(chunk_paths[0], 0, 1, language)]
             
             # Combine all transcripts
+            all_transcripts = [r["text"] for r in results]
             full_transcript = "\n\n".join(all_transcripts)
             
+            # Calculate totals
+            total_duration = sum(r.get("duration") or 0 for r in results)
+            detected_language = next(
+                (r["language"] for r in results if r.get("language") != "unknown"),
+                "unknown"
+            )
+            
             logger.info(
-                f"Transcription complete: {len(full_transcript)} chars, "
-                f"language={detected_language}, duration={total_duration:.1f}s"
+                f"✅ Transcription complete: {len(full_transcript)} chars, "
+                f"language={detected_language}, duration={total_duration/60:.1f}min"
             )
             
             return {
@@ -221,7 +278,7 @@ class TranscriptionService:
             }
             
         except Exception as e:
-            logger.error(f"Transcription failed: {type(e).__name__}: {e}")
+            logger.error(f"❌ Transcription failed: {type(e).__name__}: {e}")
             raise
             
         finally:
