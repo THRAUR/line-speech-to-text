@@ -17,8 +17,8 @@ MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB in bytes
 # Chunk duration in seconds (25 minutes = much fewer chunks)
 CHUNK_DURATION = 1500  # 25 minutes
 
-# Max parallel workers for transcription
-MAX_WORKERS = 4
+# Max parallel workers (keep low to avoid rate limits)
+MAX_WORKERS = 2
 
 
 class TranscriptionService:
@@ -143,13 +143,15 @@ class TranscriptionService:
         file_path: Path,
         chunk_index: int,
         total_chunks: int,
-        language: str | None = None
+        language: str | None = None,
+        max_retries: int = 3
     ) -> dict:
-        """Transcribe a single audio file (used for parallel processing)."""
+        """Transcribe a single audio file with retry logic for rate limits."""
+        import time
+        import re
+        
         # Create a new client for this thread (thread safety)
         client = Groq(api_key=self.api_key)
-        
-        logger.info(f"🎤 Transcribing chunk {chunk_index + 1}/{total_chunks}...")
         
         params = {
             "model": self.MODEL,
@@ -159,20 +161,48 @@ class TranscriptionService:
         if language:
             params["language"] = language
         
-        with open(file_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                file=audio_file,
-                **params
-            )
-        
-        logger.info(f"✅ Chunk {chunk_index + 1}/{total_chunks} done!")
-        
-        return {
-            "index": chunk_index,
-            "text": response.text,
-            "language": getattr(response, "language", "unknown"),
-            "duration": getattr(response, "duration", None),
-        }
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info(f"🎤 Transcribing chunk {chunk_index + 1}/{total_chunks}..." + 
+                           (f" (retry {attempt})" if attempt > 0 else ""))
+                
+                with open(file_path, "rb") as audio_file:
+                    response = client.audio.transcriptions.create(
+                        file=audio_file,
+                        **params
+                    )
+                
+                logger.info(f"✅ Chunk {chunk_index + 1}/{total_chunks} done!")
+                
+                return {
+                    "index": chunk_index,
+                    "text": response.text,
+                    "language": getattr(response, "language", "unknown"),
+                    "duration": getattr(response, "duration", None),
+                }
+                
+            except Exception as e:
+                error_str = str(e)
+                
+                # Check if it's a rate limit error
+                if "429" in error_str or "rate_limit" in error_str.lower():
+                    # Try to extract wait time from error message
+                    wait_match = re.search(r'try again in (\d+)m?([\d.]+)?s?', error_str)
+                    if wait_match:
+                        minutes = int(wait_match.group(1)) if wait_match.group(1) else 0
+                        seconds = float(wait_match.group(2)) if wait_match.group(2) else 0
+                        wait_time = minutes * 60 + seconds + 5  # Add 5 sec buffer
+                    else:
+                        wait_time = 60 * (attempt + 1)  # Exponential: 60s, 120s, 180s
+                    
+                    if attempt < max_retries:
+                        logger.warning(f"⏳ Rate limited on chunk {chunk_index + 1}, waiting {wait_time:.0f}s...")
+                        time.sleep(wait_time)
+                        continue
+                
+                # If not rate limit or max retries exceeded, raise
+                logger.error(f"❌ Chunk {chunk_index + 1} failed after {attempt + 1} attempts: {e}")
+                raise
     
     def transcribe(
         self,
