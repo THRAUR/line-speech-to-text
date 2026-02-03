@@ -25,6 +25,7 @@ from linebot.v3.webhooks import (
     MessageEvent,
     TextMessageContent,
     AudioMessageContent,
+    FileMessageContent,
 )
 
 from config import Config
@@ -257,7 +258,54 @@ def handle_audio_message(event: MessageEvent):
     thread.start()
 
 
+@handler.add(MessageEvent, message=FileMessageContent)
+def handle_file_message(event: MessageEvent):
+    """Handle incoming file messages (uploaded audio files).
+    
+    This allows users to upload M4A, MP3, WAV files instead of recording in LINE.
+    """
+    user_id = event.source.user_id
+    message_id = event.message.id
+    file_name = event.message.file_name.lower() if event.message.file_name else ""
+    
+    logger.info(f"Received file from {user_id}: {file_name}")
+    
+    # Check authentication
+    if not password_manager.is_authenticated(user_id):
+        reply_message(
+            event.reply_token,
+            password_manager.get_unauthenticated_message()
+        )
+        return
+    
+    # Check if it's an audio file
+    audio_extensions = ('.m4a', '.mp3', '.wav', '.ogg', '.flac', '.mp4', '.mpeg', '.mpga', '.webm')
+    if not file_name.endswith(audio_extensions):
+        reply_message(
+            event.reply_token,
+            f"⚠️ Please send an audio file.\n\nSupported formats: M4A, MP3, WAV, OGG, FLAC\n\nReceived: {file_name}"
+        )
+        return
+    
+    # Get file extension for transcription
+    file_ext = file_name.split('.')[-1] if '.' in file_name else 'm4a'
+    
+    # Send immediate confirmation
+    reply_message(
+        event.reply_token,
+        f"📁 File received: {event.message.file_name}\n\n" + document_generator.create_processing_message()
+    )
+    
+    # Process audio in background thread
+    thread = threading.Thread(
+        target=process_audio_async,
+        args=(user_id, message_id)
+    )
+    thread.start()
+
+
 if __name__ == "__main__":
     logger.info(f"Starting server on port {Config.PORT}")
     logger.info(f"Today's password: {password_manager.get_today_password()}")
     app.run(host="0.0.0.0", port=Config.PORT, debug=Config.DEBUG)
+
