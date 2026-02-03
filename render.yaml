@@ -1,0 +1,25 @@
+# Render Blueprint for Meeting Transcription Bot
+# See: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: meeting-summary-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DAILY_PASSWORD_SEED
+        sync: false
+    # Free tier settings
+    plan: free
+    healthCheckPath: /health
