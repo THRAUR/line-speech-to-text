@@ -236,13 +236,13 @@ def handle_audio_message(event: MessageEvent):
     
     logger.info(f"Received audio from {user_id}, message_id: {message_id}")
     
-    # Check authentication
-    if not password_manager.is_authenticated(user_id):
-        reply_message(
-            event.reply_token,
-            password_manager.get_unauthenticated_message()
-        )
-        return
+    # Auth disabled for simpler operation - uncomment to re-enable
+    # if not password_manager.is_authenticated(user_id):
+    #     reply_message(
+    #         event.reply_token,
+    #         password_manager.get_unauthenticated_message()
+    #     )
+    #     return
     
     # Send immediate confirmation
     reply_message(
@@ -270,19 +270,14 @@ def handle_file_message(event: MessageEvent):
     
     logger.info(f"Received file from {user_id}: {file_name}")
     
-    # Debug: Check auth status
-    is_auth = password_manager.is_authenticated(user_id)
-    session_count = password_manager.get_session_count()
-    logger.info(f"Auth check for {user_id}: authenticated={is_auth}, total_sessions={session_count}")
-    
-    # Check authentication
-    if not is_auth:
-        logger.warning(f"User {user_id} not authenticated, asking for password")
-        reply_message(
-            event.reply_token,
-            password_manager.get_unauthenticated_message()
-        )
-        return
+    # Auth disabled for simpler operation - uncomment to re-enable
+    # is_auth = password_manager.is_authenticated(user_id)
+    # if not is_auth:
+    #     reply_message(
+    #         event.reply_token,
+    #         password_manager.get_unauthenticated_message()
+    #     )
+    #     return
     
     # Check if it's an audio file
     audio_extensions = ('.m4a', '.mp3', '.wav', '.ogg', '.flac', '.mp4', '.mpeg', '.mpga', '.webm')
